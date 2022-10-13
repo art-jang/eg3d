@@ -24,18 +24,20 @@ from torch_utils import misc
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import grid_sample_gradfix
-
+from training.hopenet import Hopenet
 import legacy
 from metrics import metric_main
 from camera_utils import LookAtPoseSampler
 from training.crosssection_utils import sample_cross_section
-
+from torchvision import models, transforms
+from torch_utils.custom_pose import HP2Deg, load_patial_state_dict, GetRotMat
+import depth
 #----------------------------------------------------------------------------
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
-    gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
-    gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
+    gw = np.clip(7680 // training_set.image_shape[2], 7, 32) # 7680
+    gh = np.clip(4320 // training_set.image_shape[1], 4, 32) # 4320
 
     # No labels => show random subset of training samples.
     if not training_set.has_labels:
@@ -47,11 +49,11 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
         # Group training samples by label.
         label_groups = dict() # label => [idx, ...]
         for idx in range(len(training_set)):
-            label = tuple(training_set.get_details(idx).raw_label.flat[::-1])
+
+            label = tuple(training_set.get_details(idx).raw_label.flat)
             if label not in label_groups:
                 label_groups[label] = []
             label_groups[label].append(idx)
-
         # Reorder.
         label_order = list(label_groups.keys())
         rnd.shuffle(label_order)
@@ -67,7 +69,8 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
             label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
 
     # Load data.
-    images, labels = zip(*[training_set[i] for i in grid_indices])
+    images, labels, _ = zip(*[training_set[i] for i in grid_indices])
+
     return (gw, gh), np.stack(images), np.stack(labels)
 
 #----------------------------------------------------------------------------
@@ -89,6 +92,44 @@ def save_image_grid(img, fname, drange, grid_size):
         PIL.Image.fromarray(img[:, :, 0], 'L').save(fname)
     if C == 3:
         PIL.Image.fromarray(img, 'RGB').save(fname)
+
+#----------------------------------------------------------------------------
+
+def get_pseudo_pose(imgs, pose_sampler, transform, margin=None):
+    rolls = []
+    pitches = []
+    yaws = []
+
+    with torch.no_grad():
+        for img in imgs:
+            if margin is not None:
+                img = img[:, :, :int(img.size(2)*(1-margin*2)), int(img.size(3)*margin): img.size(3)-int(img.size(3)*margin)]
+            img = transform(img)
+            yaw, pitch, roll = pose_sampler(img)
+            roll = HP2Deg(roll)
+            pitch = HP2Deg(pitch)
+            yaw = HP2Deg(yaw)
+
+            rolls.append(roll)
+            pitches.append(pitch)
+            yaws.append(yaw)
+
+    return tuple(rolls), tuple(pitches), tuple(yaws)
+
+#----------------------------------------------------------------------------
+
+def set_requires_grad(nets, requires_grad=False):
+    """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
+    Parameters:
+        nets (network list)   -- a list of networks
+        requires_grad (bool)  -- whether the networks require gradients or not
+    """
+    if not isinstance(nets, list):
+        nets = [nets]
+    for net in nets:
+        if net is not None:
+            for param in net.parameters():
+                param.requires_grad = requires_grad
 
 #----------------------------------------------------------------------------
 
@@ -130,6 +171,7 @@ def training_loop(
     start_time = time.time()
     device = torch.device('cuda', rank)
     np.random.seed(random_seed * num_gpus + rank)
+    torch.cuda.set_device(device)
     torch.manual_seed(random_seed * num_gpus + rank)
     torch.backends.cudnn.benchmark = cudnn_benchmark    # Improves training speed.
     torch.backends.cuda.matmul.allow_tf32 = False       # Improves numerical accuracy.
@@ -137,7 +179,7 @@ def training_loop(
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False  # Improves numerical accuracy.
     conv2d_gradfix.enabled = True                       # Improves training speed. # TODO: ENABLE
     grid_sample_gradfix.enabled = False                  # Avoids errors with the augmentation pipe.
-
+    
     # Load training set.
     if rank == 0:
         print('Loading training set...')
@@ -155,10 +197,36 @@ def training_loop(
     if rank == 0:
         print('Constructing networks...')
     common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=training_set.num_channels)
+
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G.register_buffer('dataset_label_std', torch.tensor(training_set.get_label_std()).to(device))
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
+    
+    depth_encoder = depth.ResnetEncoder(50, False).to(device)
+    depth_decoder = depth.DepthDecoder(num_ch_enc=depth_encoder.num_ch_enc, scales=range(4)).to(device)
+    loaded_dict_enc = torch.load('depth/models/depth_face_model_Voxceleb2_10w/encoder.pth',map_location='cpu')
+    loaded_dict_dec = torch.load('depth/models/depth_face_model_Voxceleb2_10w/depth.pth',map_location='cpu')
+    filtered_dict_enc = {k: v for k, v in loaded_dict_enc.items() if k in depth_encoder.state_dict()}
+    depth_encoder.load_state_dict(filtered_dict_enc)
+    depth_decoder.load_state_dict(loaded_dict_dec)
+    set_requires_grad(depth_encoder, False)
+    set_requires_grad(depth_decoder, False) 
+    depth_encoder.eval()
+    depth_decoder.eval()
+
+    pose_sampler = Hopenet(block=models.resnet.Bottleneck, layers=[3, 4, 6, 3], num_bins=66)
+    pose_sampler.load_state_dict(torch.load(G_kwargs['hp_weight'], map_location='cpu'))
+    pose_sampler = pose_sampler.to(device)
+    set_requires_grad(pose_sampler, False)
+    transform_hopenet = transforms.Compose([transforms.Resize(size=(224, 224)),
+                                            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+
+    if num_gpus > 1:
+        depth_decoder = torch.nn.SyncBatchNorm.convert_sync_batchnorm(depth_decoder)
+        depth_encoder = torch.nn.SyncBatchNorm.convert_sync_batchnorm(depth_encoder)
+        pose_sampler = torch.nn.SyncBatchNorm.convert_sync_batchnorm(pose_sampler)
+
 
     # Resume from existing pickle.
     if (resume_pkl is not None) and (rank == 0):
@@ -194,7 +262,7 @@ def training_loop(
             for param in misc.params_and_buffers(module):
                 if param.numel() > 0 and num_gpus > 1:
                     torch.distributed.broadcast(param, src=0)
-
+ 
     # Setup training phases.
     if rank == 0:
         print('Setting up training phases...')
@@ -229,6 +297,18 @@ def training_loop(
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
         grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
+        if False: # save depth images
+            images_for_depth = images.copy()/255.
+            depth_images = depth_decoder(depth_encoder(torch.from_numpy(images_for_depth).float().to(device)))[('disp', 0)]
+            import pdb; pdb.set_trace()
+            import matplotlib.pyplot as plt
+            plt.figure()
+            plt.imshow(depth_images[0,0].cpu().detach().numpy())
+            plt.colorbar()
+            plt.savefig('pretrained_depth_model_output.jpg')
+            plt.clf()
+
+            save_image_grid(depth_images.cpu().detach().numpy(), os.path.join(run_dir, 'reals_depth.png'), drange=[depth_images.min().item(),depth_images.max().item()], grid_size=grid_size)
 
     # Initialize logs.
     if rank == 0:
@@ -258,18 +338,18 @@ def training_loop(
     if progress_fn is not None:
         progress_fn(0, total_kimg)
     while True:
-
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
-            phase_real_img, phase_real_c = next(training_set_iterator)
+            phase_real_img, phase_real_c, data_inds = next(training_set_iterator)
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
-            all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
+            all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]            
             all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
             all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
-
+            rolls, pitches, yaws = get_pseudo_pose(phase_real_img, pose_sampler=pose_sampler, transform=transform_hopenet)
+            phase_data_ind = data_inds.split(batch_gpu)
         # Execute training phases.
         for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
             if batch_idx % phase.interval != 0:
@@ -280,8 +360,24 @@ def training_loop(
             # Accumulate gradients.
             phase.opt.zero_grad(set_to_none=True)
             phase.module.requires_grad_(True)
-            for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
+            for real_img, real_c, gen_z, gen_c, roll, pitche, yaw, data_idx in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c, rolls, pitches, yaws, phase_data_ind):
+                loss.accumulate_gradients(phase=phase.name, 
+                                          real_img=real_img, 
+                                          real_c=real_c, 
+                                          gen_z=gen_z, 
+                                          gen_c=gen_c,
+                                          roll=roll,
+                                          pitch=pitche,
+                                          yaw=yaw,
+                                          gain=phase.interval, 
+                                          cur_nimg=cur_nimg,
+                                          data_idx=data_idx,
+                                          dataset=training_set_iterator,
+                                          depth_encoder=depth_encoder,
+                                          depth_decoder=depth_decoder, 
+                                          hopenet=pose_sampler,
+                                          transform=transform_hopenet)
+                                          
             phase.module.requires_grad_(False)
 
             # Update weights.
@@ -365,32 +461,96 @@ def training_loop(
             save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
             save_image_grid(images_raw, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_raw.png'), drange=[-1,1], grid_size=grid_size)
             save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth.png'), drange=[images_depth.min(), images_depth.max()], grid_size=grid_size)
-
             #--------------------
             # # Log forward-conditioned images
 
-            # forward_cam2world_pose = LookAtPoseSampler.sample(3.14/2, 3.14/2, torch.tensor([0, 0, 0.2], device=device), radius=2.7, device=device)
-            # intrinsics = torch.tensor([[4.2647, 0, 0.5], [0, 4.2647, 0.5], [0, 0, 1]], device=device)
-            # forward_label = torch.cat([forward_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9)], 1)
+            forward_cam2world_pose = LookAtPoseSampler.sample(3.14/2, 3.14/2, torch.tensor([0, 0, 0.2], device=device), radius=2.7, device=device)
+            intrinsics = torch.tensor([[4.2647, 0, 0.5], [0, 4.2647, 0.5], [0, 0, 1]], device=device)
+            
+            forward_label = torch.cat([forward_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9), torch.eye(3, device=device).reshape(-1, 9)], 1)
+            grid_ws = [G_ema.mapping(z, forward_label.expand(z.shape[0], -1)) for z, c in zip(grid_z, grid_c)]
+            out = [G_ema.synthesis(ws, c=c, noise_mode='const') for ws, c in zip(grid_ws, grid_c)]
 
-            # grid_ws = [G_ema.mapping(z, forward_label.expand(z.shape[0], -1)) for z, c in zip(grid_z, grid_c)]
-            # out = [G_ema.synthesis(ws, c=c, noise_mode='const') for ws, c in zip(grid_ws, grid_c)]
-
-            # images = torch.cat([o['image'].cpu() for o in out]).numpy()
-            # images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()
-            # images_depth = -torch.cat([o['image_depth'].cpu() for o in out]).numpy()
-            # save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_f.png'), drange=[-1,1], grid_size=grid_size)
-            # save_image_grid(images_raw, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_raw_f.png'), drange=[-1,1], grid_size=grid_size)
-            # save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth_f.png'), drange=[images_depth.min(), images_depth.max()], grid_size=grid_size)
+            images = torch.cat([o['image'].cpu() for o in out]).numpy()
+            images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()
+            images_depth = -torch.cat([o['image_depth'].cpu() for o in out]).numpy()
+            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_000_camera_000_head.png'), drange=[-1,1], grid_size=grid_size)
+            save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth_000_camera_000_head.png'), drange=[images_depth.min(), images_depth.max()], grid_size=grid_size)
 
             #--------------------
-            # # Log Cross sections
+            # # Log rotate-conditioned images (yaw 30 deg)
+            rotate_matrix = GetRotMat(torch.FloatTensor([[30]]), torch.FloatTensor([[0]]), torch.FloatTensor([[0]]), input_mode='deg').to(device)
+            rotate_label = torch.cat([forward_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9), rotate_matrix.reshape(-1, 9)], 1)
+            grid_ws = [G_ema.mapping(z, rotate_label.expand(z.shape[0], -1)) for z, c in zip(grid_z, grid_c)]
+            out = [G_ema.synthesis(ws, c=c, noise_mode='const') for ws, c in zip(grid_ws, grid_c)]
+
+            images = torch.cat([o['image'].cpu() for o in out]).numpy()
+            images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()
+            images_depth = -torch.cat([o['image_depth'].cpu() for o in out]).numpy()
+            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_000_camera_y30_head.png'), drange=[-1,1], grid_size=grid_size)
+            save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth_000_camera_y30_head.png'), drange=[images_depth.min(), images_depth.max()], grid_size=grid_size)
+
+            #--------------------
+            # # Log rotate-conditioned images (pitch 30 deg)
+            rotate_matrix = GetRotMat(torch.FloatTensor([[0]]), torch.FloatTensor([[30]]), torch.FloatTensor([[0]]), input_mode='deg').to(device)
+            rotate_label = torch.cat([forward_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9), rotate_matrix.reshape(-1, 9)], 1)
+            grid_ws = [G_ema.mapping(z, rotate_label.expand(z.shape[0], -1)) for z, c in zip(grid_z, grid_c)]
+            out = [G_ema.synthesis(ws, c=c, noise_mode='const') for ws, c in zip(grid_ws, grid_c)]
+
+            images = torch.cat([o['image'].cpu() for o in out]).numpy()
+            images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()
+            images_depth = -torch.cat([o['image_depth'].cpu() for o in out]).numpy()
+            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_000_camera_p30_head.png'), drange=[-1,1], grid_size=grid_size)
+            save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth_000_camera_p30_head.png'), drange=[images_depth.min(), images_depth.max()], grid_size=grid_size)
+
+            #--------------------
+            # # Log rotate-conditioned images (roll 30 deg)
+            rotate_matrix = GetRotMat(torch.FloatTensor([[0]]), torch.FloatTensor([[0]]), torch.FloatTensor([[30]]), input_mode='deg').to(device)
+            rotate_label = torch.cat([forward_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9), rotate_matrix.reshape(-1, 9)], 1)
+            grid_ws = [G_ema.mapping(z, rotate_label.expand(z.shape[0], -1)) for z, c in zip(grid_z, grid_c)]
+            out = [G_ema.synthesis(ws, c=c, noise_mode='const') for ws, c in zip(grid_ws, grid_c)]
+
+            images = torch.cat([o['image'].cpu() for o in out]).numpy()
+            images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()
+            images_depth = -torch.cat([o['image_depth'].cpu() for o in out]).numpy()
+            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_000_camera_r30_head.png'), drange=[-1,1], grid_size=grid_size)
+            save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth__000_camera_r30_head.png'), drange=[images_depth.min(), images_depth.max()], grid_size=grid_size)
+
+            #--------------------
+            # Log rotate-conditioned images (camera)
+            forward_cam2world_pose = LookAtPoseSampler.sample(3.14/4, 3.14/2, torch.tensor([0, 0, 0.2], device=device), radius=2.7, device=device)
+            rotate_matrix = GetRotMat(torch.FloatTensor([[0]]), torch.FloatTensor([[0]]), torch.FloatTensor([[0]]), input_mode='deg').to(device)
+            rotate_label = torch.cat([forward_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9), rotate_matrix.reshape(-1, 9)], 1)
+            grid_ws = [G_ema.mapping(z, rotate_label.expand(z.shape[0], -1)) for z, c in zip(grid_z, grid_c)]
+            out = [G_ema.synthesis(ws, c=c, noise_mode='const') for ws, c in zip(grid_ws, grid_c)]
+
+            images = torch.cat([o['image'].cpu() for o in out]).numpy()
+            images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()
+            images_depth = -torch.cat([o['image_depth'].cpu() for o in out]).numpy()
+            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_030_camera_000_head.png'), drange=[-1,1], grid_size=grid_size)
+            save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth_030_camera_000_head.png'), drange=[images_depth.min(), images_depth.max()], grid_size=grid_size)
+
+            #--------------------
+            # Log rotate-conditioned images (camera)
+            rotate_matrix = GetRotMat(torch.FloatTensor([[30]]), torch.FloatTensor([[0]]), torch.FloatTensor([[0]]), input_mode='deg').to(device)
+            rotate_label = torch.cat([forward_cam2world_pose.reshape(-1, 16), intrinsics.reshape(-1, 9), rotate_matrix.reshape(-1, 9)], 1)
+            grid_ws = [G_ema.mapping(z, rotate_label.expand(z.shape[0], -1)) for z, c in zip(grid_z, grid_c)]
+            out = [G_ema.synthesis(ws, c=c, noise_mode='const') for ws, c in zip(grid_ws, grid_c)]
+
+            images = torch.cat([o['image'].cpu() for o in out]).numpy()
+            images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()
+            images_depth = -torch.cat([o['image_depth'].cpu() for o in out]).numpy()
+            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_030_camera_y30_head.png'), drange=[-1,1], grid_size=grid_size)
+            save_image_grid(images_depth, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_depth_030_camera_y30_head.png'), drange=[images_depth.min(), images_depth.max()], grid_size=grid_size)
+
+            # --------------------
+            # Log Cross sections
 
             # grid_ws = [G_ema.mapping(z, c.expand(z.shape[0], -1)) for z, c in zip(grid_z, grid_c)]
             # out = [sample_cross_section(G_ema, ws, w=G.rendering_kwargs['box_warp']) for ws, c in zip(grid_ws, grid_c)]
             # crossections = torch.cat([o.cpu() for o in out]).numpy()
             # save_image_grid(crossections, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_crossection.png'), drange=[-50,100], grid_size=grid_size)
-
+            
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
@@ -409,7 +569,7 @@ def training_loop(
                     pickle.dump(snapshot_data, f)
 
         # Evaluate metrics.
-        if (snapshot_data is not None) and (len(metrics) > 0):
+        if (snapshot_data is not None) and (len(metrics) > 0) and cur_tick > 0:
             if rank == 0:
                 print(run_dir)
                 print('Evaluating metrics...')
@@ -437,6 +597,11 @@ def training_loop(
             fields = dict(stats_dict, timestamp=timestamp)
             stats_jsonl.write(json.dumps(fields) + '\n')
             stats_jsonl.flush()
+            if rank == 0:
+                losses = [(key, fields[key]) for key in fields if 'Loss/' in key]
+                losses = ["{}: {:.4f}".format(key[5:], loss['mean']) for key, loss in losses]
+                print('\t'.join(losses))
+
         if stats_tfevents is not None:
             global_step = int(cur_nimg / 1e3)
             walltime = timestamp - start_time

@@ -54,8 +54,9 @@ if __name__ == '__main__':
             filename, label = example
             if '_mirror' in filename:
                 continue
+            
 
-            image_path = os.path.join(args.source, filename)
+            image_path = os.path.join(args.source, filename.split('.')[0] + '.jpg')
             img = Image.open(image_path)
 
             if args.dest is not None: # skip saving originals if dest==source

@@ -18,8 +18,8 @@ import subprocess
 import gdown
 
 parser = argparse.ArgumentParser()
-parser.add_argument('inzip', type=str) # the AFHQ zip downloaded from starganV2 (https://github.com/clovaai/stargan-v2)
-parser.add_argument('outzip', type=str, required=False, default='processed_afhq.zip') # this is the output path to write the new zip
+parser.add_argument('--inzip', type=str) # the AFHQ zip downloaded from starganV2 (https://github.com/clovaai/stargan-v2)
+parser.add_argument('--outzip', type=str, required=False, default='processed_afhq.zip') # this is the output path to write the new zip
 args = parser.parse_args()
 
 
@@ -42,34 +42,34 @@ except Exception as e:
     print("There was a problem while importing the dataset_tool. Are you in the correct virtual environment?")
     exit()
 
+# with tempfile.TemporaryDirectory() as working_dir:
+working_dir = '/home/jyj/Workspace/ICASSP2022/eg3d/dataset_preprocessing/afhq/tmp/afhq'
+os.makedirs(working_dir, exist_ok=True)
 
-with tempfile.TemporaryDirectory() as working_dir:
-    cmd = f"""
-        unzip {input_dataset_path} -d {working_dir}/extracted_images;
-        mv {working_dir}/extracted_images/train/cat/ {working_dir}/cat_images/;
-    """
-    subprocess.run([cmd], shell=True, check=True)
-
-
-    """Download dataset.json file"""
-    json_url = 'https://drive.google.com/file/d/1FQXQ26kAgRyN2iOH8CBl3P9CGPIQ5TAQ/view?usp=sharing'
-    gdown.download(json_url, f'{working_dir}/cat_images/dataset.json', quiet=False, fuzzy=True)
+# cmd = f"""
+#     unzip {input_dataset_path} -d {working_dir}/extracted_images;
+#     mv {working_dir}/extracted_images/train/cat/ {working_dir}/cat_images/;
+# """
+# subprocess.run([cmd], shell=True, check=True)
 
 
-    print("Mirroring dataset...")
-    cmd = f"""
-        python {mirror_tool_path} \
-            --source={working_dir}/cat_images \
-            --dest={working_dir}/mirrored_images
-    """
-    subprocess.run([cmd], shell=True, check=True)
+"""Download dataset.json file"""
+# json_url = 'https://drive.google.com/file/d/1FQXQ26kAgRyN2iOH8CBl3P9CGPIQ5TAQ/view?usp=sharing'
+# gdown.download(json_url, f'{working_dir}/cat_images/dataset.json', quiet=False, fuzzy=True)
 
 
-    print("Creating dataset zip...")
-    cmd = f"""
-        python {dataset_tool_path} \
-            --source {working_dir}/mirrored_images \
-            --dest {output_dataset_path} \
-            --resolution 512x512
-    """
-    subprocess.run([cmd], shell=True, check=True)
+print("Mirroring dataset...")
+cmd = f"""
+    python {mirror_tool_path} --source={working_dir}/cat_images --dest={working_dir}/mirrored_images
+"""
+subprocess.run([cmd], shell=True, check=True)
+
+
+print("Creating dataset zip...")
+cmd = f"""
+    python {dataset_tool_path} \
+        --source {working_dir}/mirrored_images \
+        --dest {output_dataset_path} \
+        --resolution 512x512
+"""
+subprocess.run([cmd], shell=True, check=True)

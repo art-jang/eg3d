@@ -204,6 +204,7 @@ class MappingNetwork(torch.nn.Module):
         w_avg_beta      = 0.998,    # Decay for tracking the moving average of W during training, None = do not track.
     ):
         super().__init__()
+        c_dim=18
         self.z_dim = z_dim
         self.c_dim = c_dim
         self.w_dim = w_dim
@@ -231,6 +232,7 @@ class MappingNetwork(torch.nn.Module):
             self.register_buffer('w_avg', torch.zeros([w_dim]))
 
     def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False):
+        c = c[:, 16:].clone()
         # Embed, normalize, and concat inputs.
         x = None
         with torch.autograd.profiler.record_function('input'):

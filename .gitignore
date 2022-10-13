@@ -1,3 +1,4 @@
+.vscode/
 images/
 .DS_Store
 .ipynb_checkpoints
@@ -14,6 +15,15 @@ archive
 *.ply
 eval
 out
+results
+chectpoints
+*.png
+*.pth
+*.zip
+dataset_preprocessing/
+*.mrc
+*.txt
+*.json
 
 # evaluation:
 temp/
@@ -21,7 +31,6 @@ shapes/
 imgs/
 vids/
 *.mp4
-
 stylegan3/results
 eg3d/results
 eg3d_results

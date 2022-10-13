@@ -9,11 +9,16 @@
 # its affiliates is strictly prohibited.
 
 import torch
+import torch.nn as nn
 from torch_utils import persistence
 from training.networks_stylegan2 import Generator as StyleGAN2Backbone
 from training.volumetric_rendering.renderer import ImportanceRenderer
 from training.volumetric_rendering.ray_sampler import RaySampler
+from training.pose_estimator import PoseEstimator
+from torch_utils.custom_pose import HP2Deg
+from torchvision import models
 import dnnlib
+
 
 @persistence.persistent_class
 class TriPlaneGenerator(torch.nn.Module):
@@ -27,6 +32,7 @@ class TriPlaneGenerator(torch.nn.Module):
         mapping_kwargs      = {},   # Arguments for MappingNetwork.
         rendering_kwargs    = {},
         sr_kwargs = {},
+        hp_weight = None,
         **synthesis_kwargs,         # Arguments for SynthesisNetwork.
     ):
         super().__init__()
@@ -37,14 +43,26 @@ class TriPlaneGenerator(torch.nn.Module):
         self.img_channels=img_channels
         self.renderer = ImportanceRenderer()
         self.ray_sampler = RaySampler()
+        # self.pose_estimator = PoseEstimator(block=models.resnet.Bottleneck, layers=[3, 4, 6, 3], num_bins=66)
         self.backbone = StyleGAN2Backbone(z_dim, c_dim, w_dim, img_resolution=256, img_channels=32*3, mapping_kwargs=mapping_kwargs, **synthesis_kwargs)
         self.superresolution = dnnlib.util.construct_class_by_name(class_name=rendering_kwargs['superresolution_module'], channels=32, img_resolution=img_resolution, sr_num_fp16_res=sr_num_fp16_res, sr_antialias=rendering_kwargs['sr_antialias'], **sr_kwargs)
         self.decoder = OSGDecoder(32, {'decoder_lr_mul': rendering_kwargs.get('decoder_lr_mul', 1), 'decoder_output_dim': 32})
         self.neural_rendering_resolution = 64
-        self.rendering_kwargs = rendering_kwargs
-    
+        self.rendering_kwargs = rendering_kwargs   
         self._last_planes = None
-    
+        # self.W = nn.Parameter(torch.randn(1))
+        # self.b = nn.Parameter(torch.randn(1))
+
+    def get_pseudo_pose(self, img):
+        img_224 = self.transform_hopenet(img)
+        yaw, pitch, roll = self.pose_sampler(img_224)
+
+        yaw = self._headpose_pred_to_degree(yaw)
+        pitch = self._headpose_pred_to_degree(pitch)
+        roll = self._headpose_pred_to_degree(roll)
+        
+        return yaw, pitch, roll
+
     def mapping(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False):
         if self.rendering_kwargs['c_gen_conditioning_zero']:
                 c = torch.zeros_like(c)
@@ -81,6 +99,8 @@ class TriPlaneGenerator(torch.nn.Module):
         H = W = self.neural_rendering_resolution
         feature_image = feature_samples.permute(0, 2, 1).reshape(N, feature_samples.shape[-1], H, W).contiguous()
         depth_image = depth_samples.permute(0, 2, 1).reshape(N, 1, H, W)
+        # if True: # for depth scaling
+        #     depth_image = depth_image*self.W + self.b
 
         # Run superresolution to get final image
         rgb_image = feature_image[:, :3]

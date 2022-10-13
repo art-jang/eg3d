@@ -122,7 +122,7 @@ class DualDiscriminator(torch.nn.Module):
     ):
         super().__init__()
         img_channels *= 2
-
+        c_dim = 18
         self.c_dim = c_dim
         self.img_resolution = img_resolution
         self.img_resolution_log2 = int(np.log2(img_resolution))
