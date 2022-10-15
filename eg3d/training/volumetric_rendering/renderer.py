@@ -78,7 +78,7 @@ def sample_from_3dgrid(grid, coordinates):
     N, C, H, W, D = sampled_features.shape
     sampled_features = sampled_features.permute(0, 4, 3, 2, 1).reshape(N, H*W*D, C)
     return sampled_features
-
+        
 class ImportanceRenderer(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -104,7 +104,6 @@ class ImportanceRenderer(torch.nn.Module):
         # Coarse Pass
         sample_coordinates = (ray_origins.unsqueeze(-2) + depths_coarse * ray_directions.unsqueeze(-2)).reshape(batch_size, -1, 3)
         sample_directions = ray_directions.unsqueeze(-2).expand(-1, -1, samples_per_ray, -1).reshape(batch_size, -1, 3)
-
 
         out = self.run_model(planes, decoder, sample_coordinates, sample_directions, rendering_options)
         colors_coarse = out['rgb']
@@ -141,7 +140,6 @@ class ImportanceRenderer(torch.nn.Module):
 
     def run_model(self, planes, decoder, sample_coordinates, sample_directions, options):
         sampled_features = sample_from_planes(self.plane_axes, planes, sample_coordinates, padding_mode='zeros', box_warp=options['box_warp'])
-
         out = decoder(sampled_features, sample_directions)
         if options.get('density_noise', 0) > 0:
             out['sigma'] += torch.randn_like(out['sigma']) * options['density_noise']

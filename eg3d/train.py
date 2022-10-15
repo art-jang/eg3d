@@ -143,7 +143,11 @@ def parse_comma_separated_list(s):
 @click.option('--data_list',    help='Training data list',                                      type=str, default=None)
 @click.option('--use_ratio',    help='Data use ratio',                                          type=float, default=1.0)
 @click.option('--pl',           help='Pseudo label path for random camera',                     type=str, default=None)
-@click.option('--hp_weight',    help='Pre-trained head pose estimator weight',                  type=str, default=None)
+@click.option('--use_pose',     help='Use pre-trained pose network',                            type=bool, default=True)
+@click.option('--use_depth',    help='Use pre-trained depth network',                           type=bool, default=True)
+@click.option('--pt_posenet',   help='Pre-trained head pose estimator weight',                  type=str, default='./checkpoints/hopenet_robust_alpha1.pkl')
+@click.option('--pt_depth_encoder',   help='Pre-trained depth encoder weight',                  type=str, default='./depth/models/depth_face_model_Voxceleb2_10w/encoder.pth')
+@click.option('--pt_depth_decoder',   help='Pre-trained depth decoder weight',                  type=str, default='./depth/models/depth_face_model_Voxceleb2_10w/depth.pth')
 @click.option('--resolution',   help='Resolution of training data',                             type=int, default=256)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
@@ -232,10 +236,16 @@ def main(**kwargs):
     # Initialize config.
     opts = dnnlib.EasyDict(kwargs) # Command line arguments.
     c = dnnlib.EasyDict() # Main config dict.
-    c.G_kwargs = dnnlib.EasyDict(class_name=None, z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict(), hp_weight=opts.hp_weight)
+    c.G_kwargs = dnnlib.EasyDict(class_name=None, z_dim=512, w_dim=512, mapping_kwargs=dnnlib.EasyDict())
     c.D_kwargs = dnnlib.EasyDict(class_name='training.networks_stylegan2.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
     c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
     c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
+    c.pretrain_kwargs = dnnlib.EasyDict(class_name=None, 
+                                        pretrained_posenet=opts.pt_posenet, 
+                                        pt_depth_encoder=opts.pt_depth_encoder, 
+                                        pt_depth_decoder=opts.pt_depth_decoder,
+                                        use_depth=opts.use_depth,
+                                        use_pose=opts.use_pose)
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss')
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
 

@@ -19,6 +19,19 @@ import torch.nn as nn
 
 from training.volumetric_rendering import math_utils
 
+
+class HeadPoseSampler:
+
+    @staticmethod
+    def sample(yaw_range, pitch_range, roll_range, batch_size=1, device='cpu'):
+
+        y = (2*yaw_range)*torch.rand((batch_size, 1), device=device) - yaw_range
+        p = (2*pitch_range)*torch.rand((batch_size, 1), device=device) - pitch_range
+        r = (2*roll_range)*torch.rand((batch_size, 1), device=device) - roll_range
+
+        return y, p, r
+
+
 class GaussianCameraPoseSampler:
     """
     Samples pitch and yaw from a Gaussian distribution and returns a camera pose.

@@ -341,7 +341,7 @@ class VoxcelebImageDataset(Dataset):
             labels = json.load(f)['labels']
         if labels is None:
             return None
-
+        
         labels = [random.choice(labels)[1] for _ in range(len(self._video_fnames))]
         identity = np.repeat(np.expand_dims(np.identity(3).reshape(-1), axis=0), len(self._video_fnames), axis=0)
         labels = np.concatenate([np.array(labels), identity], axis=-1)

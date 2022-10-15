@@ -36,8 +36,8 @@ import depth
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
-    gw = np.clip(7680 // training_set.image_shape[2], 7, 32) # 7680
-    gh = np.clip(4320 // training_set.image_shape[1], 4, 32) # 4320
+    gw = np.clip(4000 // training_set.image_shape[2], 7, 32) # 7680
+    gh = np.clip(3000 // training_set.image_shape[1], 4, 32) # 4320
 
     # No labels => show random subset of training samples.
     if not training_set.has_labels:
@@ -141,6 +141,7 @@ def training_loop(
     D_kwargs                = {},       # Options for discriminator network.
     G_opt_kwargs            = {},       # Options for generator optimizer.
     D_opt_kwargs            = {},       # Options for discriminator optimizer.
+    pretrain_kwargs         = {},       # Options for pre-trained networks
     augment_kwargs          = None,     # Options for augmentation pipeline. None = disable.
     loss_kwargs             = {},       # Options for loss function.
     metrics                 = [],       # Metrics to evaluate during training.
@@ -162,7 +163,7 @@ def training_loop(
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
     resume_pkl              = None,     # Network pickle to resume training from.
-    resume_kimg             = 0,        # First kimg to report when resuming training.
+    resume_kimg             = 2252,        # First kimg to report when resuming training.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
@@ -203,30 +204,38 @@ def training_loop(
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
     
-    depth_encoder = depth.ResnetEncoder(50, False).to(device)
-    depth_decoder = depth.DepthDecoder(num_ch_enc=depth_encoder.num_ch_enc, scales=range(4)).to(device)
-    loaded_dict_enc = torch.load('depth/models/depth_face_model_Voxceleb2_10w/encoder.pth',map_location='cpu')
-    loaded_dict_dec = torch.load('depth/models/depth_face_model_Voxceleb2_10w/depth.pth',map_location='cpu')
-    filtered_dict_enc = {k: v for k, v in loaded_dict_enc.items() if k in depth_encoder.state_dict()}
-    depth_encoder.load_state_dict(filtered_dict_enc)
-    depth_decoder.load_state_dict(loaded_dict_dec)
-    set_requires_grad(depth_encoder, False)
-    set_requires_grad(depth_decoder, False) 
-    depth_encoder.eval()
-    depth_decoder.eval()
+    if pretrain_kwargs.use_depth:
+        depth_encoder = depth.ResnetEncoder(50, False).to(device)
+        depth_decoder = depth.DepthDecoder(num_ch_enc=depth_encoder.num_ch_enc, scales=range(4)).to(device)
+        loaded_dict_enc = torch.load('depth/models/depth_face_model_Voxceleb2_10w/encoder.pth',map_location='cpu')
+        loaded_dict_dec = torch.load('depth/models/depth_face_model_Voxceleb2_10w/depth.pth',map_location='cpu')
+        filtered_dict_enc = {k: v for k, v in loaded_dict_enc.items() if k in depth_encoder.state_dict()}
+        depth_encoder.load_state_dict(filtered_dict_enc)
+        depth_decoder.load_state_dict(loaded_dict_dec)
+        set_requires_grad(depth_encoder, False)
+        set_requires_grad(depth_decoder, False) 
+        depth_encoder.eval()
+        depth_decoder.eval()
+        if num_gpus > 1:
+            depth_encoder = torch.nn.SyncBatchNorm.convert_sync_batchnorm(depth_encoder)
+            depth_decoder = torch.nn.SyncBatchNorm.convert_sync_batchnorm(depth_decoder)
+    else:
+        depth_encoder = None
+        depth_decoder = None
 
-    pose_sampler = Hopenet(block=models.resnet.Bottleneck, layers=[3, 4, 6, 3], num_bins=66)
-    pose_sampler.load_state_dict(torch.load(G_kwargs['hp_weight'], map_location='cpu'))
-    pose_sampler = pose_sampler.to(device)
-    set_requires_grad(pose_sampler, False)
-    transform_hopenet = transforms.Compose([transforms.Resize(size=(224, 224)),
-                                            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+    if pretrain_kwargs.use_pose:
+        pose_extractor = Hopenet(block=models.resnet.Bottleneck, layers=[3, 4, 6, 3], num_bins=66)
+        pose_extractor.load_state_dict(torch.load('./checkpoints/hopenet_robust_alpha1.pkl', map_location='cpu'))
+        pose_extractor = pose_extractor.to(device)
+        set_requires_grad(pose_extractor, False)
 
-    if num_gpus > 1:
-        depth_decoder = torch.nn.SyncBatchNorm.convert_sync_batchnorm(depth_decoder)
-        depth_encoder = torch.nn.SyncBatchNorm.convert_sync_batchnorm(depth_encoder)
-        pose_sampler = torch.nn.SyncBatchNorm.convert_sync_batchnorm(pose_sampler)
-
+        pose_transform = transforms.Compose([transforms.Resize(size=(224, 224)),
+                                             transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                             std=[0.229, 0.224, 0.225])])
+        if num_gpus > 1:
+            pose_extractor = torch.nn.SyncBatchNorm.convert_sync_batchnorm(pose_extractor)
+    else:
+        pose_extractor = None
 
     # Resume from existing pickle.
     if (resume_pkl is not None) and (rank == 0):
@@ -330,7 +339,7 @@ def training_loop(
         print(f'Training for {total_kimg} kimg...')
         print()
     cur_nimg = resume_kimg * 1000
-    cur_tick = 0
+    cur_tick = cur_nimg // 4000
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
     maintenance_time = tick_start_time - start_time
@@ -340,7 +349,7 @@ def training_loop(
     while True:
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
-            phase_real_img, phase_real_c, data_inds = next(training_set_iterator)
+            phase_real_img, phase_real_c, _ = next(training_set_iterator)
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
@@ -348,8 +357,6 @@ def training_loop(
             all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
             all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
-            rolls, pitches, yaws = get_pseudo_pose(phase_real_img, pose_sampler=pose_sampler, transform=transform_hopenet)
-            phase_data_ind = data_inds.split(batch_gpu)
         # Execute training phases.
         for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
             if batch_idx % phase.interval != 0:
@@ -360,23 +367,18 @@ def training_loop(
             # Accumulate gradients.
             phase.opt.zero_grad(set_to_none=True)
             phase.module.requires_grad_(True)
-            for real_img, real_c, gen_z, gen_c, roll, pitche, yaw, data_idx in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c, rolls, pitches, yaws, phase_data_ind):
+            for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
                 loss.accumulate_gradients(phase=phase.name, 
                                           real_img=real_img, 
                                           real_c=real_c, 
                                           gen_z=gen_z, 
                                           gen_c=gen_c,
-                                          roll=roll,
-                                          pitch=pitche,
-                                          yaw=yaw,
                                           gain=phase.interval, 
                                           cur_nimg=cur_nimg,
-                                          data_idx=data_idx,
-                                          dataset=training_set_iterator,
                                           depth_encoder=depth_encoder,
                                           depth_decoder=depth_decoder, 
-                                          hopenet=pose_sampler,
-                                          transform=transform_hopenet)
+                                          pose_extractor=pose_extractor,
+                                          pose_transform=pose_transform)
                                           
             phase.module.requires_grad_(False)
 
@@ -453,7 +455,7 @@ def training_loop(
                 print('Aborting...')
 
         # Save image snapshot.
-        if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
+        if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0 and cur_tick > 0):
             out = [G_ema(z=z, c=c, noise_mode='const') for z, c in zip(grid_z, grid_c)]
             images = torch.cat([o['image'].cpu() for o in out]).numpy()
             images_raw = torch.cat([o['image_raw'].cpu() for o in out]).numpy()

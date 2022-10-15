@@ -76,7 +76,7 @@ def GetRotMat(yaw, pitch, roll, t=None, input_mode=None):
     else:
         m_dim = 3
     rot_mat = torch.eye(m_dim).unsqueeze(0).repeat(yaw.size(0), 1, 1).to(yaw.device)
-    R = rotation_matrix_y(yaw) @ rotation_matrix_x(pitch) @ rotation_matrix_z(roll)
+    R = rotation_matrix_x(roll) @ rotation_matrix_y(pitch) @ rotation_matrix_z(yaw)
     rot_mat[:, :3, :3] = R
     if t is not None:
         t = torch.FloatTensor(t).to(yaw.device)

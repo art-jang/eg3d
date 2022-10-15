@@ -11,7 +11,7 @@
 import torch
 import torch.nn as nn
 from torch_utils import persistence
-from training.networks_stylegan2 import Generator as StyleGAN2Backbone
+from training.networks_stylegan2 import Generator as StyleGAN2Backbone, MappingNetwork
 from training.volumetric_rendering.renderer import ImportanceRenderer
 from training.volumetric_rendering.ray_sampler import RaySampler
 from training.pose_estimator import PoseEstimator
@@ -19,6 +19,40 @@ from torch_utils.custom_pose import HP2Deg
 from torchvision import models
 import dnnlib
 
+
+class Deformation(nn.Module):
+    def __init__(self, D=4, W=128, input_ch=32, input_ch_condition=9, skips=[],):
+        super(Deformation, self).__init__()
+        self.D = D
+        self.W = W
+        self.input_ch = input_ch
+        self.input_ch_condition = input_ch_condition
+        self.skips = skips
+        self._deform, self._deform_out = self.create_net()
+
+    def create_net(self):
+        layers = [nn.Linear(self.input_ch + self.input_ch_condition, self.W)]
+        for i in range(self.D - 2):
+            layer = nn.Linear
+            in_channels = self.W
+            if i in self.skips:
+                in_channels += self.input_ch
+            layers += [layer(in_channels, self.W)]
+        return nn.ModuleList(layers), nn.Linear(self.W, self.input_ch)
+
+    def query_time(self, new_pts, cond, net, net_final):
+        h = torch.cat([new_pts, cond], dim=-1)
+        for i, l in enumerate(net):
+            h = net[i](h)
+            h = torch.nn.functional.relu(h)
+            if i in self.skips:
+                h = torch.cat([new_pts, h], -1)
+        return net_final(h)
+
+    def forward(self, input_pts, cond):
+        dx = self.query_time(input_pts, cond, self._deform, self._deform_out)
+        out = input_pts + dx
+        return out
 
 @persistence.persistent_class
 class TriPlaneGenerator(torch.nn.Module):
@@ -32,7 +66,6 @@ class TriPlaneGenerator(torch.nn.Module):
         mapping_kwargs      = {},   # Arguments for MappingNetwork.
         rendering_kwargs    = {},
         sr_kwargs = {},
-        hp_weight = None,
         **synthesis_kwargs,         # Arguments for SynthesisNetwork.
     ):
         super().__init__()
@@ -43,25 +76,12 @@ class TriPlaneGenerator(torch.nn.Module):
         self.img_channels=img_channels
         self.renderer = ImportanceRenderer()
         self.ray_sampler = RaySampler()
-        # self.pose_estimator = PoseEstimator(block=models.resnet.Bottleneck, layers=[3, 4, 6, 3], num_bins=66)
         self.backbone = StyleGAN2Backbone(z_dim, c_dim, w_dim, img_resolution=256, img_channels=32*3, mapping_kwargs=mapping_kwargs, **synthesis_kwargs)
         self.superresolution = dnnlib.util.construct_class_by_name(class_name=rendering_kwargs['superresolution_module'], channels=32, img_resolution=img_resolution, sr_num_fp16_res=sr_num_fp16_res, sr_antialias=rendering_kwargs['sr_antialias'], **sr_kwargs)
         self.decoder = OSGDecoder(32, {'decoder_lr_mul': rendering_kwargs.get('decoder_lr_mul', 1), 'decoder_output_dim': 32})
         self.neural_rendering_resolution = 64
         self.rendering_kwargs = rendering_kwargs   
         self._last_planes = None
-        # self.W = nn.Parameter(torch.randn(1))
-        # self.b = nn.Parameter(torch.randn(1))
-
-    def get_pseudo_pose(self, img):
-        img_224 = self.transform_hopenet(img)
-        yaw, pitch, roll = self.pose_sampler(img_224)
-
-        yaw = self._headpose_pred_to_degree(yaw)
-        pitch = self._headpose_pred_to_degree(pitch)
-        roll = self._headpose_pred_to_degree(roll)
-        
-        return yaw, pitch, roll
 
     def mapping(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False):
         if self.rendering_kwargs['c_gen_conditioning_zero']:
@@ -85,7 +105,7 @@ class TriPlaneGenerator(torch.nn.Module):
         if use_cached_backbone and self._last_planes is not None:
             planes = self._last_planes
         else:
-            planes = self.backbone.synthesis(ws, update_emas=update_emas, **synthesis_kwargs)
+            planes = self.backbone.synthesis(ws, update_emas=update_emas, **synthesis_kwargs) # [B, 96, 256, 256]
         if cache_backbone:
             self._last_planes = planes
 

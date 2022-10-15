@@ -24,6 +24,7 @@ dataset_preprocessing/
 *.mrc
 *.txt
 *.json
+*.jpg
 
 # evaluation:
 temp/

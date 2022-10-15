@@ -18,7 +18,7 @@ from torch_utils.ops import upfirdn2d
 from training.dual_discriminator import filtered_resizing
 from torch_utils.custom_pose import GetRotMat, HP2Deg
 import torch.nn.functional as F
-from camera_utils import LookAtPoseSampler
+from camera_utils import LookAtPoseSampler, HeadPoseSampler
 
 #----------------------------------------------------------------------------
 def compute_scale_and_shift(prediction, target, mask):
@@ -84,7 +84,7 @@ class StyleGAN2Loss(Loss):
             c_gen_conditioning = torch.where(torch.rand((c.shape[0], 1), device=c.device) < swapping_prob, c_swapped, c)
         else:
             c_gen_conditioning = torch.zeros_like(c)
-
+        
         ws = self.G.mapping(z, c_gen_conditioning, update_emas=update_emas)
         if self.style_mixing_prob > 0:
             with torch.autograd.profiler.record_function('style_mixing'):
@@ -111,7 +111,7 @@ class StyleGAN2Loss(Loss):
         logits = self.D(img, c, update_emas=update_emas)
         return logits
 
-    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, roll, pitch, yaw, gain, cur_nimg, data_idx, dataset, depth_encoder, depth_decoder, hopenet, transform):
+    def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg, depth_encoder=None, depth_decoder=None, pose_extractor=None, pose_transform=None):
         assert phase in ['Gmain', 'Greg', 'Gboth', 'Dmain', 'Dreg', 'Dboth']
         if self.G.rendering_kwargs.get('density_reg', 0) == 0:
             phase = {'Greg': 'none', 'Gboth': 'Gmain'}.get(phase, phase)
@@ -138,57 +138,82 @@ class StyleGAN2Loss(Loss):
                 real_img_raw = upfirdn2d.filter2d(real_img_raw, f / f.sum())
 
         real_img = {'image': real_img, 'image_raw': real_img_raw}
-        forward_cam2world_pose = LookAtPoseSampler.sample(3.14/2, 3.14/2, torch.tensor([0, 0, 0.2], device=real_img_raw.device), radius=2.7, device=real_img_raw.device).repeat(real_img_raw.size(0), 1, 1)
-        face_pose = GetRotMat(yaw=yaw.unsqueeze(-1), pitch=pitch.unsqueeze(-1), roll=roll.unsqueeze(-1), input_mode='deg')
-        # forward_cam2world_pose.requires_grad = True
-        # face_pose.requires_grad = True
-        # gen_c.requires_grad = True
-        gen_c = torch.cat([forward_cam2world_pose.reshape(-1, 16), gen_c[:, 16:25], face_pose.reshape(-1, 9)], dim=1)
-        # dataset._dataset._raw_labels[data_idx] = gen_c.cpu().detach().numpy()
-        real_c = gen_c.detach() 
+        # Camera sampling setup (Gradually increased stddev)
+        start_moving_camera = 2000 * 1e3
+        end_depth_backprop = 15000 * 1e3
+
+        pose_weight = min((cur_nimg - start_moving_camera) / (15000 * 1e3), 1)
+        depth_weight = max((end_depth_backprop - cur_nimg) / (15000 * 1e3), 0) * 10
+
+        lookat_position = torch.tensor([0, 0, 0.2], device=real_img_raw.device)
+        Move_cam = True if (cur_nimg//128)%2 == 0 else False
+         if Move_cam:
+            stddev = 0.5
+        else:
+            stddev = 0
+            
+        gen_cam_pose = LookAtPoseSampler.sample(horizontal_mean=np.pi/2, 
+                                                vertical_mean=np.pi/2, 
+                                                lookat_position=lookat_position, 
+                                                horizontal_stddev=stddev,
+                                                vertical_stddev=stddev,
+                                                radius=2.7,
+                                                batch_size=real_img['image'].size(0),
+                                                device=real_img_raw.device)
+
+        # pl_yaw, pl_pitch, pl_roll = HeadPoseSampler.sample(yaw_range=45,
+        #                                                    pitch_range=15,
+        #                                                    roll_range=15,
+        #                                                    batch_size=real_img['image'].size(0), 
+        #                                                    device=real_img_raw.device)
+        pl_yaw, pl_pitch, pl_roll = pose_extractor(pose_transform(real_img['image'].detach()))
+        pl_head_pose = GetRotMat(pl_yaw, pl_pitch, pl_roll)
+        intrinsic_params = gen_c[:, 16:25].clone()
+        gen_c = torch.cat([gen_cam_pose.reshape(-1, 16), intrinsic_params, pl_head_pose.reshape(-1, 9)], dim=1)
+        real_c = gen_c.detach()
 
         # Gmain: Maximize logits for generated images.
         if phase in ['Gmain', 'Gboth']:
             with torch.autograd.profiler.record_function('Gmain_forward'):
                 gen_img, _gen_ws = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution)
-                if False: # head conditioning
-                    gen_yaw, gen_pitch, gen_roll = hopenet(transform(gen_img['image']))
-                    import pdb; pdb.set_trace()
-                    gen_yaw = HP2Deg(gen_yaw)
-                    gen_pitch = HP2Deg(gen_pitch)
-                    gen_roll = HP2Deg(gen_roll)
-                
-                    # To do: backpropagate pose loss when the generated image is enoughly close to the real image
-                    # Curriculam learning: start with small pose loss and increase it gradually
-                    pose_weight = min(cur_nimg / (15000 * 1e3), 1)                
-                    loss_pose = (torch.mean(torch.abs(gen_yaw - yaw)) + torch.mean(torch.abs(gen_pitch - pitch)) + torch.mean(torch.abs(gen_roll - roll)))/30.0 * pose_weight
+                if pose_extractor is not None and cur_nimg > start_moving_camera: # head conditioning
+                    gen_yaw, gen_pitch, gen_roll = pose_extractor(pose_transform(gen_img['image']))
+                    if Move_cam:
+                        gen_head_pose = GetRotMat(gen_yaw, gen_pitch, gen_roll)
+                        gen_c = torch.cat([gen_cam_pose.reshape(-1, 16), intrinsic_params, gen_head_pose.reshape(-1, 9)], dim=1)
+                        loss_pose = torch.zeros(1).to(gen_c.device)
+                    else: # pors reconstruction
+                        loss_pose = (torch.mean(torch.abs(HP2Deg(gen_yaw) - HP2Deg(pl_yaw).detach())) + torch.mean(torch.abs(HP2Deg(gen_pitch) - HP2Deg(pl_pitch).detach())) + torch.mean(torch.abs(HP2Deg(gen_roll) - HP2Deg(pl_roll).detach())))/30.0 * pose_weight
+                else:
+                    loss_pose = torch.zeros(1).to(gen_c.device)
+                if depth_encoder is not None and depth_weight > 0. and not Move_cam:
+                    with torch.no_grad():
+                        img_min = gen_img['image'].min()
+                        img_max = gen_img['image'].max()
+                        depth_GT_inp = ((gen_img['image'].clone().detach() - img_min) / (img_max - img_min))
 
-                    training_stats.report('Loss/G/loss_pose', loss_pose)
-                    training_stats.report('Loss/G/pose_weight', pose_weight)
-
-                if True:
-                    img_min = gen_img['image'].min()
-                    img_max = gen_img['image'].max()
-                    depth_GT_inp = ((gen_img['image'].clone().detach() - img_min) / (img_max - img_min))
-                    depth_GT = depth_decoder(depth_encoder(depth_GT_inp))[('disp', 0)]
-                    depth_GT = F.interpolate(depth_GT, size=gen_img['image_depth'].shape[2:], mode='bilinear', align_corners=False)
-                    depth_GT = 1 - depth_GT
-                    depth_GT = depth_GT.squeeze(1) # remove channel
-
-                    scale, shift = compute_scale_and_shift(gen_img['image_depth'].squeeze(1).detach(), depth_GT.detach(), torch.ones_like(depth_GT))
-                    gen_img['image_depth'] = gen_img['image_depth'].squeeze(1)
-                    prediction = gen_img['image_depth'] * scale.unsqueeze(-1).unsqueeze(-1) + shift.unsqueeze(-1).unsqueeze(-1)
-                    loss_depth = F.l1_loss(prediction, depth_GT)
-                    training_stats.report('Loss/G/loss_depth', loss_depth)
+                        depth_GT = depth_decoder(depth_encoder(depth_GT_inp))[('disp', 0)]
+                        depth_GT = F.interpolate(depth_GT, size=gen_img['image_depth'].shape[2:], mode='bilinear', align_corners=False)
+                        depth_GT = (1 - depth_GT)
+                        depth_GT - (depth_GT - depth_GT.min())/depth_GT.max()
+                        depth_GT = depth_GT*0.75+2.25
+                    loss_depth = F.l1_loss(gen_img['image_depth'], depth_GT.detach()) * depth_weight
+                else:
+                    loss_depth = torch.zeros(1).to(gen_c.device)
                     
                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma)
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
+                training_stats.report('Loss/G/loss_depth', loss_depth)
+                training_stats.report('Loss/G/depth_weight', depth_weight)
+                training_stats.report('Loss/G/loss_pose', loss_pose)
+                training_stats.report('Loss/G/pose_weight', pose_weight)
+
                 loss_Gmain = torch.nn.functional.softplus(-gen_logits)
                 training_stats.report('Loss/G/loss', loss_Gmain)
                 
             with torch.autograd.profiler.record_function('Gmain_backward'):
-                (loss_Gmain.mean()+loss_depth).mul(gain).backward()
+                (loss_Gmain.mean() + loss_depth + loss_pose).mul(gain).backward()
         # Density Regularization
         if phase in ['Greg', 'Gboth'] and self.G.rendering_kwargs.get('density_reg', 0) > 0 and self.G.rendering_kwargs['reg_type'] == 'l1':
             if swapping_prob is not None:
@@ -277,7 +302,6 @@ class StyleGAN2Loss(Loss):
             monotonic_loss = torch.relu(sigma_initial - sigma_perturbed).mean() * 10
             monotonic_loss.mul(gain).backward()
 
-
             if swapping_prob is not None:
                 c_swapped = torch.roll(gen_c.clone(), 1, 0)
                 c_gen_conditioning = torch.where(torch.rand([], device=gen_c.device) < swapping_prob, c_swapped, gen_c)
@@ -305,6 +329,12 @@ class StyleGAN2Loss(Loss):
         if phase in ['Dmain', 'Dboth']:
             with torch.autograd.profiler.record_function('Dgen_forward'):
                 gen_img, _gen_ws = self.run_G(gen_z, gen_c, swapping_prob=swapping_prob, neural_rendering_resolution=neural_rendering_resolution, update_emas=True)
+
+                if Move_cam: # Camera pose is changed
+                    gen_yaw, gen_pitch, gen_roll = pose_extractor(pose_transform(gen_img['image'].clone()))
+                    gen_head_pose = GetRotMat(gen_yaw, gen_pitch, gen_roll)
+                    gen_c[:, -9:] = gen_head_pose.reshape(-1, 9)
+
                 gen_logits = self.run_D(gen_img, gen_c, blur_sigma=blur_sigma, update_emas=True)
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
@@ -316,6 +346,7 @@ class StyleGAN2Loss(Loss):
         # Dr1: Apply R1 regularization.
         if phase in ['Dmain', 'Dreg', 'Dboth']:
             name = 'Dreal' if phase == 'Dmain' else 'Dr1' if phase == 'Dreg' else 'Dreal_Dr1'
+
             with torch.autograd.profiler.record_function(name + '_forward'):
                 real_img_tmp_image = real_img['image'].detach().requires_grad_(phase in ['Dreg', 'Dboth'])
                 real_img_tmp_image_raw = real_img['image_raw'].detach().requires_grad_(phase in ['Dreg', 'Dboth'])
